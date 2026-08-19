@@ -147,12 +147,12 @@ class MemoryRepository(private val context: Context, profileId: String) {
         // recomputing them for the same stored embedding across queries.
         val resolvedLeftNorm = when {
             left.normalized -> 1.0
-            leftId != null -> normCache.getOrPut(leftId) { sqrt(leftNorm) }.toDouble()
+            leftId != null -> normCache.getOrPut(leftId) { sqrt(leftNorm).toFloat() }.toDouble()
             else -> sqrt(leftNorm)
         }
         val resolvedRightNorm = when {
             right.normalized -> 1.0
-            rightId != null -> normCache.getOrPut(rightId) { sqrt(rightNorm) }.toDouble()
+            rightId != null -> normCache.getOrPut(rightId) { sqrt(rightNorm).toFloat() }.toDouble()
             else -> sqrt(rightNorm)
         }
 

@@ -74,7 +74,7 @@ class JsEngine(private val context: Context) {
         maximumPoolSize = 4,
         keepAliveTime = 30L,
         unit = TimeUnit.SECONDS,
-        workQueue = LinkedBlockingQueue(64),
+        workQueue = LinkedBlockingQueue<Runnable>(64),
         threadFactory = ThreadFactory {
             Thread(it).apply {
                 isDaemon = true
