@@ -66,7 +66,7 @@ class MemoryRepository(private val context: Context, profileId: String) {
         private const val DANGLING_LINK_CLEANUP_INTERVAL_MS = 30_000L
         private const val SEARCH_RRF_K = 60.0
         private const val SEARCH_KEYWORD_COVERAGE_BONUS = 0.6
-        private const val SEARCH_RELEVANCE_THRESHOLD = 0.025
+        private const val SEARCH_RELEVANCE_THRESHOLD = 0.15
         private val INDEX_KEY_SANITIZE_REGEX = Regex("[^a-zA-Z0-9._-]")
 
         fun normalizeFolderPath(folderPath: String?): String? {
@@ -99,16 +99,36 @@ class MemoryRepository(private val context: Context, profileId: String) {
     @Volatile
     private var lastDanglingCleanupAtMs: Long = 0L
 
+    // Cache of precomputed embedding L2 norms keyed by memory id, used to
+    // avoid recomputing norms for the same stored embedding across queries.
+    private val normCache = mutableMapOf<Long, Float>()
+
     private suspend fun generateEmbedding(text: String, config: CloudEmbeddingConfig): Embedding? {
         return cloudEmbeddingService.generateEmbedding(config, text)
     }
 
-    private fun cosineSimilarity(left: Embedding, right: Embedding): Float {
+    private fun cosineSimilarity(
+        left: Embedding,
+        right: Embedding,
+        leftId: Long? = null,
+        rightId: Long? = null
+    ): Float {
         val leftVector = left.vector
         val rightVector = right.vector
 
         if (leftVector.isEmpty() || rightVector.isEmpty() || leftVector.size != rightVector.size) {
             return 0f
+        }
+
+        // Fast path: when both embeddings are already L2-normalized, cosine
+        // similarity collapses to a plain dot product and we can skip the norm
+        // math entirely.
+        if (left.normalized && right.normalized) {
+            var dot = 0.0
+            for (index in leftVector.indices) {
+                dot += leftVector[index].toDouble() * rightVector[index].toDouble()
+            }
+            return dot.toFloat()
         }
 
         var dot = 0.0
@@ -123,11 +143,24 @@ class MemoryRepository(private val context: Context, profileId: String) {
             rightNorm += rightValue * rightValue
         }
 
-        if (leftNorm <= 0.0 || rightNorm <= 0.0) {
+        // Resolve (and cache) reusable norms by memory id so we avoid
+        // recomputing them for the same stored embedding across queries.
+        val resolvedLeftNorm = when {
+            left.normalized -> 1.0
+            leftId != null -> normCache.getOrPut(leftId) { sqrt(leftNorm) }.toDouble()
+            else -> sqrt(leftNorm)
+        }
+        val resolvedRightNorm = when {
+            right.normalized -> 1.0
+            rightId != null -> normCache.getOrPut(rightId) { sqrt(rightNorm) }.toDouble()
+            else -> sqrt(rightNorm)
+        }
+
+        if (resolvedLeftNorm <= 0.0 || resolvedRightNorm <= 0.0) {
             return 0f
         }
 
-        return (dot / (sqrt(leftNorm) * sqrt(rightNorm))).toFloat()
+        return (dot / (resolvedLeftNorm * resolvedRightNorm)).toFloat()
     }
 
     /**
@@ -187,11 +220,25 @@ class MemoryRepository(private val context: Context, profileId: String) {
     )
 
     private fun splitSearchKeywords(query: String): List<String> {
-        return if (query.contains('|')) {
-            query.split('|').map { it.trim() }.filter { it.isNotEmpty() }
-        } else {
-            query.split(Regex("\\s+")).map { it.trim() }.filter { it.isNotEmpty() }
+        val keywords = mutableListOf<String>()
+        val quotedPhraseRegex = "\"([^\"]+)\"".toRegex()
+
+        // First, extract quoted phrases (e.g., "machine learning") as whole keywords.
+        quotedPhraseRegex.findAll(query).forEach { match ->
+            match.groupValues[1].trim().takeIf { it.isNotEmpty() }?.let { keywords.add(it) }
         }
+
+        // Remove the quoted phrases so they are not re-split by '|' or whitespace.
+        val remaining = quotedPhraseRegex.replace(query, "")
+
+        // Then split the remaining text by '|' or whitespace.
+        if (remaining.contains('|')) {
+            keywords.addAll(remaining.split('|').map { it.trim() }.filter { it.isNotEmpty() })
+        } else {
+            keywords.addAll(remaining.split(Regex("\\s+")).map { it.trim() }.filter { it.isNotEmpty() })
+        }
+
+        return keywords.distinct()
     }
 
     private fun buildLexicalQueryTokens(query: String, keywords: List<String>): List<String> {
@@ -600,7 +647,7 @@ class MemoryRepository(private val context: Context, profileId: String) {
             val memory = memoryById[memoryId] ?: return@mapNotNull null
             val memoryEmbedding = memory.embedding ?: return@mapNotNull null
             if (memoryEmbedding.vector.size != queryEmbedding.vector.size) return@mapNotNull null
-            memory to cosineSimilarity(queryEmbedding, memoryEmbedding)
+            memory to cosineSimilarity(queryEmbedding, memoryEmbedding, rightId = memoryId)
         }
     }
 
@@ -627,7 +674,7 @@ class MemoryRepository(private val context: Context, profileId: String) {
             val chunk = chunkById[chunkId] ?: return@mapNotNull null
             val chunkEmbedding = chunk.embedding ?: return@mapNotNull null
             if (chunkEmbedding.vector.size != queryEmbedding.vector.size) return@mapNotNull null
-            chunk to cosineSimilarity(queryEmbedding, chunkEmbedding)
+            chunk to cosineSimilarity(queryEmbedding, chunkEmbedding, rightId = chunkId)
         }
     }
 
@@ -1132,10 +1179,10 @@ class MemoryRepository(private val context: Context, profileId: String) {
         query: String,
         folderPath: String? = null,
         scoreMode: MemoryScoreMode = MemoryScoreMode.BALANCED,
-        keywordWeight: Float = 10.0f,
-        tagWeight: Float = 0.0f,
-        semanticWeight: Float = 0.5f,
-        edgeWeight: Float = 0.4f,
+        keywordWeight: Float = 3.0f,
+        tagWeight: Float = 0.5f,
+        semanticWeight: Float = 1.5f,
+        edgeWeight: Float = 0.6f,
         relevanceThreshold: Double = SEARCH_RELEVANCE_THRESHOLD,
         createdAtStartMs: Long? = null,
         createdAtEndMs: Long? = null
@@ -1158,10 +1205,10 @@ class MemoryRepository(private val context: Context, profileId: String) {
         query: String,
         folderPath: String? = null,
         scoreMode: MemoryScoreMode = MemoryScoreMode.BALANCED,
-        keywordWeight: Float = 10.0f,
-        tagWeight: Float = 0.0f,
-        semanticWeight: Float = 0.5f,
-        edgeWeight: Float = 0.4f,
+        keywordWeight: Float = 3.0f,
+        tagWeight: Float = 0.5f,
+        semanticWeight: Float = 1.5f,
+        edgeWeight: Float = 0.6f,
         relevanceThreshold: Double = SEARCH_RELEVANCE_THRESHOLD,
         createdAtStartMs: Long? = null,
         createdAtEndMs: Long? = null
@@ -1184,10 +1231,10 @@ class MemoryRepository(private val context: Context, profileId: String) {
         query: String,
         folderPath: String? = null,
         scoreMode: MemoryScoreMode = MemoryScoreMode.BALANCED,
-        keywordWeight: Float = 10.0f,
-        tagWeight: Float = 0.0f,
-        semanticWeight: Float = 0.5f,
-        edgeWeight: Float = 0.4f,
+        keywordWeight: Float = 3.0f,
+        tagWeight: Float = 0.5f,
+        semanticWeight: Float = 1.5f,
+        edgeWeight: Float = 0.6f,
         relevanceThreshold: Double = SEARCH_RELEVANCE_THRESHOLD,
         createdAtStartMs: Long? = null,
         createdAtEndMs: Long? = null

@@ -35,6 +35,10 @@ android {
                 "proguard-rules.pro"
             )
         }
+        create("clone") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

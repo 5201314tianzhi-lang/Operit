@@ -68,6 +68,10 @@ android {
                 "proguard-rules.pro"
             )
         }
+        create("clone") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+        }
     }
 
     externalNativeBuild {

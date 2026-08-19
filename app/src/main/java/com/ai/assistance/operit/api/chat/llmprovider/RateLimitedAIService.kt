@@ -27,10 +27,12 @@ class RateLimitedAIService(
         enableRetry: Boolean,
         statsCategory: com.ai.assistance.operit.data.stats.TokenStatCategory?
     ): Stream<String> = com.ai.assistance.operit.util.stream.stream {
-        rateLimiter?.acquire()
-        concurrencySemaphore?.acquire()
-
+        var concurrencyAcquired = false
         try {
+            rateLimiter?.acquire()
+            concurrencySemaphore?.acquire()
+            concurrencyAcquired = true
+
             delegate.sendMessage(
                 context = context,
                 chatHistory = chatHistory,
@@ -48,7 +50,7 @@ class RateLimitedAIService(
                 emit(chunk)
             }
         } finally {
-            concurrencySemaphore?.release()
+            if (concurrencyAcquired) concurrencySemaphore?.release()
         }
     }
 }

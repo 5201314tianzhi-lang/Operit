@@ -27,9 +27,13 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -63,10 +67,29 @@ class JsEngine(private val context: Context) {
     @Volatile
     private var quickJsThread: Thread? = null
 
-    private val quickJsExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "OperitQuickJsEngine").apply {
+    private val jsThreadIdCounter = AtomicInteger(0)
+
+    private val quickJsExecutor = ThreadPoolExecutor(
+        corePoolSize = 2,
+        maximumPoolSize = 4,
+        keepAliveTime = 30L,
+        unit = TimeUnit.SECONDS,
+        workQueue = LinkedBlockingQueue(64),
+        threadFactory = ThreadFactory {
+            Thread(it).apply {
+                isDaemon = true
+                name = "operit-js-${jsThreadIdCounter.getAndIncrement()}"
+                priority = Thread.NORM_PRIORITY - 1
+                quickJsThread = this
+            }
+        },
+        handler = ThreadPoolExecutor.CallerRunsPolicy()
+    )
+
+    private val composeDslExecutor = Executors.newCachedThreadPool { r ->
+        Thread(r).apply {
             isDaemon = true
-            quickJsThread = this
+            name = "operit-compose-dsl"
         }
     }
     private val quickJsDispatcher = quickJsExecutor.asCoroutineDispatcher()
@@ -1090,7 +1113,7 @@ class JsEngine(private val context: Context) {
             return false
         }
 
-        Thread {
+        composeDslExecutor.execute {
             val result =
                 try {
                     executeComposeDslAction(
@@ -1107,7 +1130,7 @@ class JsEngine(private val context: Context) {
                         onError?.invoke(errorText)
                         onComplete?.invoke()
                     }
-                    return@Thread
+                    return@execute
                 }
 
             val errorText = extractJsExecutionErrorMessage(result)
@@ -1123,7 +1146,7 @@ class JsEngine(private val context: Context) {
                 }
                 onComplete?.invoke()
             }
-        }.start()
+        }
 
         return true
     }
@@ -2618,6 +2641,11 @@ class JsEngine(private val context: Context) {
                         quickJsExecutor.shutdownNow()
                     } catch (e: Exception) {
                         AppLogger.e(TAG, "Error shutting down QuickJS executor: ${e.message}", e)
+                    }
+                    try {
+                        composeDslExecutor.shutdownNow()
+                    } catch (e: Exception) {
+                        AppLogger.e(TAG, "Error shutting down compose DSL executor: ${e.message}", e)
                     }
                 }
             }

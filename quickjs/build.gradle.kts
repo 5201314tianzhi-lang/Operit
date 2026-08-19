@@ -30,6 +30,10 @@ android {
         debug {
             isMinifyEnabled = false
         }
+        create("clone") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+        }
     }
 
     externalNativeBuild {

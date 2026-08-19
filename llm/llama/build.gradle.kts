@@ -37,6 +37,10 @@ android {
         release {
             isMinifyEnabled = false
         }
+        create("clone") {
+            initWith(getByName("debug"))
+            matchingFallbacks += listOf("debug")
+        }
     }
 
     externalNativeBuild {

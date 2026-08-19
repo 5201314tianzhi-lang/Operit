@@ -28,12 +28,16 @@ import com.ai.assistance.operit.core.tools.MessageSendResultData
 import com.ai.assistance.operit.data.preferences.initAndroidPermissionPreferences
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.util.LinkedList
 import java.util.Queue
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.random.Random
@@ -83,6 +87,8 @@ class WorkflowExecutor(private val context: Context) {
     companion object {
         private const val TAG = "WorkflowExecutor"
     }
+
+    private val regexCache = ConcurrentHashMap<String, Regex>()
 
     private fun throwCancellation(
         node: WorkflowNode,
@@ -313,7 +319,7 @@ class WorkflowExecutor(private val context: Context) {
     private fun extractByRegex(source: String, pattern: String, group: Int, defaultValue: String): String {
         if (pattern.isBlank()) return defaultValue
         return try {
-            val match = Regex(pattern).find(source)
+            val match = regexCache.getOrPut(pattern) { Regex(pattern) }.find(source)
             val groupValue = match?.groups?.get(group)?.value
             groupValue ?: defaultValue
         } catch (_: Exception) {
@@ -754,43 +760,48 @@ class WorkflowExecutor(private val context: Context) {
     }
     
     /**
-     * 使用DFS检测有向图中的环
+     * 使用基于入度的 Kahn 拓扑排序算法迭代检测有向图中的环
      * @return true 表示存在环，false 表示无环
      */
     private fun detectCycle(adjacencyList: Map<String, List<String>>, nodes: List<WorkflowNode>): Boolean {
-        val visitState = mutableMapOf<String, Int>() // 0=未访问, 1=访问中, 2=已完成
-        
-        // 初始化所有节点为未访问
+        // 基于邻接表构建入度映射
+        val inDegree = mutableMapOf<String, Int>()
         for (node in nodes) {
-            visitState[node.id] = 0
+            inDegree[node.id] = 0
         }
-        
-        fun dfs(nodeId: String): Boolean {
-            visitState[nodeId] = 1 // 标记为访问中
-            
-            // 访问所有后继节点
-            for (nextNodeId in adjacencyList[nodeId] ?: emptyList()) {
-                when (visitState[nextNodeId]) {
-                    1 -> return true // 访问到"访问中"的节点，发现环
-                    0 -> if (dfs(nextNodeId)) return true // 递归访问未访问的节点
-                    // 2 -> 已完成的节点，跳过
-                }
-            }
-            
-            visitState[nodeId] = 2 // 标记为已完成
-            return false
-        }
-        
-        // 对每个未访问的节点执行DFS
-        for (node in nodes) {
-            if (visitState[node.id] == 0) {
-                if (dfs(node.id)) {
-                    return true
+        for ((_, targets) in adjacencyList) {
+            for (targetId in targets) {
+                if (inDegree.containsKey(targetId)) {
+                    inDegree[targetId] = (inDegree[targetId] ?: 0) + 1
                 }
             }
         }
-        
-        return false
+
+        // 使用 ArrayDeque 作为队列，将入度为0的节点入队
+        val queue = ArrayDeque<String>()
+        for ((nodeId, degree) in inDegree) {
+            if (degree == 0) {
+                queue.addLast(nodeId)
+            }
+        }
+
+        // 依次处理入度为0的节点，并将其后继节点的入度减1
+        var processedCount = 0
+        while (queue.isNotEmpty()) {
+            val current = queue.removeFirst()
+            processedCount++
+            for (nextNodeId in adjacencyList[current] ?: emptyList()) {
+                if (!inDegree.containsKey(nextNodeId)) continue
+                val newDegree = (inDegree[nextNodeId] ?: 0) - 1
+                inDegree[nextNodeId] = newDegree
+                if (newDegree == 0) {
+                    queue.addLast(nextNodeId)
+                }
+            }
+        }
+
+        // 处理的节点数小于总节点数，说明存在环
+        return processedCount < nodes.size
     }
     
     /**
@@ -847,95 +858,167 @@ class WorkflowExecutor(private val context: Context) {
                 queue.offer(nodeId)
             }
         }
-        
+
+        // 批次内并行执行就绪节点，批次之间串行推进
+        data class ExecTask(
+            val nodeId: String,
+            val node: WorkflowNode,
+            val incomingConnections: List<WorkflowNodeConnection>
+        )
+
         while (queue.isNotEmpty()) {
             currentCoroutineContext().ensureActive()
-            val currentNodeId = queue.poll() ?: break
-            
-            // 检查节点是否已经被执行过
-            if (nodeResults.containsKey(currentNodeId)) {
-                runLogger.d(context.getString(R.string.workflow_log_node_already_executed, currentNodeId), nodeId = currentNodeId)
-                continue
-            }
-            
-            // 查找节点
-            val node = nodeById[currentNodeId]
-            if (node == null) {
-                runLogger.w(context.getString(R.string.workflow_log_node_not_exist, currentNodeId), nodeId = currentNodeId)
-                continue
+
+            // 一次性取出当前所有就绪节点
+            val batch = mutableListOf<String>()
+            while (queue.isNotEmpty()) {
+                val id = queue.poll()
+                if (id == null) break
+                batch.add(id)
             }
 
-            val incomingConnections = incomingConnectionsByTarget[currentNodeId].orEmpty().filter { conn ->
-                if (!reachableNodeIds.contains(conn.sourceNodeId)) {
-                    return@filter false
+            // 串行预处理：过滤已执行/不存在的节点，判断是否需要执行，处理跳过节点
+            val execTasks = mutableListOf<ExecTask>()
+
+            for (currentNodeId in batch) {
+                // 检查节点是否已经被执行过
+                if (nodeResults.containsKey(currentNodeId)) {
+                    runLogger.d(context.getString(R.string.workflow_log_node_already_executed, currentNodeId), nodeId = currentNodeId)
+                    continue
                 }
-                if (triggerNodeIds.contains(conn.sourceNodeId) && !startedTriggerNodeIds.contains(conn.sourceNodeId)) {
-                    return@filter false
+
+                // 查找节点
+                val node = nodeById[currentNodeId]
+                if (node == null) {
+                    runLogger.w(context.getString(R.string.workflow_log_node_not_exist, currentNodeId), nodeId = currentNodeId)
+                    continue
                 }
-                true
+
+                val incomingConnections = incomingConnectionsByTarget[currentNodeId].orEmpty().filter { conn ->
+                    if (!reachableNodeIds.contains(conn.sourceNodeId)) {
+                        return@filter false
+                    }
+                    if (triggerNodeIds.contains(conn.sourceNodeId) && !startedTriggerNodeIds.contains(conn.sourceNodeId)) {
+                        return@filter false
+                    }
+                    true
+                }
+
+                val shouldExecute = if (incomingConnections.isEmpty()) {
+                    true
+                } else {
+                    incomingConnections.any { conn ->
+                        val sourceNode = nodeById[conn.sourceNodeId]
+                        val sourceState = nodeResults[conn.sourceNodeId]
+                        if (isSkippedState(sourceState)) {
+                            return@any false
+                        }
+
+                        val rawCondition = conn.condition?.trim().orEmpty()
+                        val effectiveCondition = if (rawCondition.isBlank() && (sourceNode is ConditionNode || sourceNode is LogicNode)) {
+                            "true"
+                        } else {
+                            rawCondition
+                        }
+
+                        val conditionKey = effectiveCondition.trim().lowercase()
+                        when (conditionKey) {
+                            "error", "failed", "on_error" -> return@any sourceState is NodeExecutionState.Failed
+                            "success", "ok", "on_success" -> return@any sourceState is NodeExecutionState.Success
+                        }
+
+                        if (effectiveCondition.isBlank()) {
+                            return@any sourceState is NodeExecutionState.Success
+                        }
+
+                        val desiredBool = when (effectiveCondition.lowercase()) {
+                            "true" -> true
+                            "false" -> false
+                            else -> null
+                        }
+
+                        val sourceResult = (sourceState as? NodeExecutionState.Success)?.result
+                        if (sourceResult == null) {
+                            return@any false
+                        }
+
+                        if (desiredBool != null) {
+                            val actual = parseBooleanLike(sourceResult) ?: false
+                            return@any actual == desiredBool
+                        }
+
+                        return@any try {
+                            Regex(effectiveCondition).containsMatchIn(sourceResult)
+                        } catch (_: Exception) {
+                            false
+                        }
+                    }
+                }
+
+                if (!shouldExecute) {
+                    runLogger.d(
+                        context.getString(R.string.workflow_log_condition_not_met_skip, node.name, node.id),
+                        nodeId = node.id,
+                        nodeName = node.name
+                    )
+                    val skipReason = context.getString(R.string.workflow_condition_not_met)
+                    nodeResults[node.id] = NodeExecutionState.Skipped(skipReason)
+                    onNodeStateChange(node.id, NodeExecutionState.Skipped(skipReason))
+
+                    for (nextNodeId in dependencyGraph.adjacencyList[currentNodeId] ?: emptyList()) {
+                        if (!currentInDegree.containsKey(nextNodeId)) {
+                            continue
+                        }
+                        currentInDegree[nextNodeId] = (currentInDegree[nextNodeId] ?: 0) - 1
+                        if (currentInDegree[nextNodeId] == 0) {
+                            queue.offer(nextNodeId)
+                        }
+                    }
+                    continue
+                }
+
+                execTasks.add(ExecTask(currentNodeId, node, incomingConnections))
             }
 
-            val shouldExecute = if (incomingConnections.isEmpty()) {
-                true
-            } else {
-                incomingConnections.any { conn ->
-                    val sourceNode = nodeById[conn.sourceNodeId]
-                    val sourceState = nodeResults[conn.sourceNodeId]
-                    if (isSkippedState(sourceState)) {
-                        return@any false
+            // 并行执行批次中所有需要执行的节点
+            val executionResults: List<Boolean> = coroutineScope {
+                execTasks.map { task ->
+                    async(Dispatchers.IO) {
+                        runLogger.d(
+                            context.getString(R.string.workflow_log_execute_node, task.node.name, task.node.id),
+                            nodeId = task.node.id,
+                            nodeName = task.node.name
+                        )
+                        executeNode(
+                            task.node,
+                            workflow,
+                            task.incomingConnections,
+                            nodeById,
+                            nodeResults,
+                            triggerExtras,
+                            onNodeStateChange,
+                            runLogger
+                        )
                     }
-
-                    val rawCondition = conn.condition?.trim().orEmpty()
-                    val effectiveCondition = if (rawCondition.isBlank() && (sourceNode is ConditionNode || sourceNode is LogicNode)) {
-                        "true"
-                    } else {
-                        rawCondition
-                    }
-
-                    val conditionKey = effectiveCondition.trim().lowercase()
-                    when (conditionKey) {
-                        "error", "failed", "on_error" -> return@any sourceState is NodeExecutionState.Failed
-                        "success", "ok", "on_success" -> return@any sourceState is NodeExecutionState.Success
-                    }
-
-                    if (effectiveCondition.isBlank()) {
-                        return@any sourceState is NodeExecutionState.Success
-                    }
-
-                    val desiredBool = when (effectiveCondition.lowercase()) {
-                        "true" -> true
-                        "false" -> false
-                        else -> null
-                    }
-
-                    val sourceResult = (sourceState as? NodeExecutionState.Success)?.result
-                    if (sourceResult == null) {
-                        return@any false
-                    }
-
-                    if (desiredBool != null) {
-                        val actual = parseBooleanLike(sourceResult) ?: false
-                        return@any actual == desiredBool
-                    }
-
-                    return@any try {
-                        Regex(effectiveCondition).containsMatchIn(sourceResult)
-                    } catch (_: Exception) {
-                        false
-                    }
-                }
+                }.awaitAll()
             }
 
-            if (!shouldExecute) {
-                runLogger.d(
-                    context.getString(R.string.workflow_log_condition_not_met_skip, node.name, node.id),
-                    nodeId = node.id,
-                    nodeName = node.name
-                )
-                val skipReason = context.getString(R.string.workflow_condition_not_met)
-                nodeResults[node.id] = NodeExecutionState.Skipped(skipReason)
-                onNodeStateChange(node.id, NodeExecutionState.Skipped(skipReason))
+            // 串行处理执行结果：记录失败并更新后继节点入度
+            for ((index, task) in execTasks.withIndex()) {
+                val executionSuccess = executionResults[index]
+                val currentNodeId = task.nodeId
 
+                // 如果执行失败，停止整个流程
+                if (!executionSuccess) {
+                    runLogger.e(
+                        context.getString(R.string.workflow_log_node_failed, task.node.name),
+                        nodeId = task.node.id,
+                        nodeName = task.node.name
+                    )
+                    hasFailure = true
+                }
+
+                // 将后继节点的入度减1，如果入度变为0则加入队列
                 for (nextNodeId in dependencyGraph.adjacencyList[currentNodeId] ?: emptyList()) {
                     if (!currentInDegree.containsKey(nextNodeId)) {
                         continue
@@ -944,47 +1027,6 @@ class WorkflowExecutor(private val context: Context) {
                     if (currentInDegree[nextNodeId] == 0) {
                         queue.offer(nextNodeId)
                     }
-                }
-                continue
-            }
-            
-            runLogger.d(
-                context.getString(R.string.workflow_log_execute_node, node.name, node.id),
-                nodeId = node.id,
-                nodeName = node.name
-            )
-            
-            // 执行节点
-            val executionSuccess =
-                executeNode(
-                    node,
-                    workflow,
-                    incomingConnections,
-                    nodeById,
-                    nodeResults,
-                    triggerExtras,
-                    onNodeStateChange,
-                    runLogger
-                )
-            
-            // 如果执行失败，停止整个流程
-            if (!executionSuccess) {
-                runLogger.e(
-                    context.getString(R.string.workflow_log_node_failed, node.name),
-                    nodeId = node.id,
-                    nodeName = node.name
-                )
-                hasFailure = true
-            }
-            
-            // 将后继节点的入度减1，如果入度变为0则加入队列
-            for (nextNodeId in dependencyGraph.adjacencyList[currentNodeId] ?: emptyList()) {
-                if (!currentInDegree.containsKey(nextNodeId)) {
-                    continue
-                }
-                currentInDegree[nextNodeId] = (currentInDegree[nextNodeId] ?: 0) - 1
-                if (currentInDegree[nextNodeId] == 0) {
-                    queue.offer(nextNodeId)
                 }
             }
         }
