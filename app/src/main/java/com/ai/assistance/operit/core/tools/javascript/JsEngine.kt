@@ -69,22 +69,14 @@ class JsEngine(private val context: Context) {
 
     private val jsThreadIdCounter = AtomicInteger(0)
 
-    private val quickJsExecutor = ThreadPoolExecutor(
-        corePoolSize = 2,
-        maximumPoolSize = 4,
-        keepAliveTime = 30L,
-        unit = TimeUnit.SECONDS,
-        workQueue = LinkedBlockingQueue<Runnable>(64),
-        threadFactory = ThreadFactory {
-            Thread(it).apply {
-                isDaemon = true
-                name = "operit-js-${jsThreadIdCounter.getAndIncrement()}"
-                priority = Thread.NORM_PRIORITY - 1
-                quickJsThread = this
-            }
-        },
-        handler = ThreadPoolExecutor.CallerRunsPolicy()
-    )
+    private val quickJsExecutor = Executors.newFixedThreadPool(4) { r ->
+        Thread(r).apply {
+            isDaemon = true
+            name = "operit-js-${jsThreadIdCounter.getAndIncrement()}"
+            priority = Thread.NORM_PRIORITY - 1
+            quickJsThread = this
+        }
+    }
 
     private val composeDslExecutor = Executors.newCachedThreadPool { r ->
         Thread(r).apply {
