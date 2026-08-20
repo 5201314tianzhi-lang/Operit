@@ -446,6 +446,13 @@ android {
             matchingFallbacks += listOf("debug")
             resValue("string", "app_name", "Operit Clone")
         }
+        create("pro") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".pro"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("debug")
+            resValue("string", "app_name", "NexusAI Pro")
+        }
         create("nightly") {
             isMinifyEnabled = false
             isShrinkResources = false
@@ -461,6 +468,12 @@ android {
         }
     }
     applicationVariants.all {
+        if (buildType.name == "pro") {
+            outputs.all {
+                val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
+                output.outputFileName = "app-pro.apk"
+            }
+        }
         if (buildType.name == "nightly") {
             outputs.all {
                 val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
