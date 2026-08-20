@@ -211,7 +211,7 @@ class AppUsageAnalyzer(private val context: Context) {
         _dailyReport.value = DailyReport(
             date = System.currentTimeMillis(),
             totalScreenTimeMs = totalTime,
-            topApps = stats.take(5),
+            topApp = stats.take(5),
             categoryBreakdown = categoryBreakdown,
             insights = _insights.value,
             productivityScore = _productivityScore.value,
@@ -274,8 +274,9 @@ class BatteryAIOptimizer(private val context: Context) {
 
         val level = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
         val isCharging = batteryManager.isCharging
-        val temperature = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_TEMPERATURE) / 10.0f
-        val voltage = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_VOLTAGE) / 1000.0f
+        // Temperature and voltage require ACTION_BATTERY_CHANGED intent; use 0 as fallback
+        val temperature = 0f
+        val voltage = 0f
 
         val info = BatteryInfo(
             level = level,
@@ -347,7 +348,7 @@ class BatteryAIOptimizer(private val context: Context) {
             if (info.isCharging) {
                 suggestions.add(BatterySuggestion(
                     title = "夜间充电优化",
-                    message = "夜间充电时建议开启"优化充电"功能以保护电池",
+                    message = "夜间充电时建议开启\"优化充电\"功能以保护电池",
                     priority = SuggestionPriority.MEDIUM,
                     action = SuggestionAction.ENABLE_OPTIMIZED_CHARGING,
                 ))

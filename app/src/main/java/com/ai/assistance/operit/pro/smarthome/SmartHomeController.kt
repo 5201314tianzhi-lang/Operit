@@ -185,10 +185,10 @@ class SmartHomeController {
                     AutomationCondition.TURNED_ON -> state.isOn
                     AutomationCondition.TURNED_OFF -> !state.isOn
                     AutomationCondition.TEMPERATURE_ABOVE -> {
-                        (state.temperature ?: 0) > automation.threshold
+                        (state.temperature ?: 0.0) > automation.threshold
                     }
                     AutomationCondition.TEMPERATURE_BELOW -> {
-                        (state.temperature ?: 100) < automation.threshold
+                        (state.temperature ?: 100.0) < automation.threshold
                     }
                 }
                 if (shouldTrigger) {
